@@ -1,0 +1,57 @@
+[Version]
+Signature="$WINDOWS NT$"
+Class=Keyboard
+ClassGuid={4D36E96B-E325-11CE-BFC1-08002BE10318}
+PnpLockdown=1
+Provider=%Mfg%
+CatalogFile=NoMoreCopilot.cat
+DriverVer=08/25/2025,1.0.0.0
+
+[SourceDisksNames]
+1 = %DiskName%,,,
+
+[SourceDisksFiles]
+NoMoreCopilot.sys = 1
+
+[DestinationDirs]
+DefaultDestDir = 12   ; %SystemRoot%\System32\drivers
+
+[Manufacturer]
+%Mfg%=Models,NTamd64
+
+; Your device IDs (most specific first)
+[Models.NTamd64]
+%Desc%=Filter_Inst, ACPI\VEN_MSFT&DEV_0001
+%Desc%=Filter_Inst, ACPI\MSFT0001
+%Desc%=Filter_Inst, *MSFT0001
+
+; ---- Chain to the base PS/2 keyboard install (don't replace it) ----
+[Filter_Inst.NT]
+Include = keyboard.inf
+Needs   = STANDARD_Inst
+CopyFiles = @NoMoreCopilot.sys
+
+[Filter_Inst.NT.Services]
+Include = keyboard.inf
+Needs   = STANDARD_Inst.Services
+; NOTE: flags = 0 (no SPSVCINST_ASSOCSERVICE). We are a FILTER, not the function driver.
+AddService = NoMoreCopilot, 0x00000000, NoMoreCopilot_Service
+
+[Filter_Inst.NT.HW]
+; Append our filter to per-device UpperFilters (REG_MULTI_SZ)
+AddReg = Add_UpperFilter
+
+[Add_UpperFilter]
+HKR,,"UpperFilters",0x00010008,"NoMoreCopilot"
+
+[NoMoreCopilot_Service]
+DisplayName   = %Desc%
+ServiceType   = 1        ; SERVICE_KERNEL_DRIVER
+StartType     = 3        ; DEMAND_START   (you can use 1 for BOOT_START later if desired)
+ErrorControl  = 1
+ServiceBinary = %12%\NoMoreCopilot.sys
+
+[Strings]
+Mfg="You"
+Desc="Copilot->RightCtrl Keyboard Filter (Built-in only)"
+DiskName="NoMoreCopilot Install Files"
