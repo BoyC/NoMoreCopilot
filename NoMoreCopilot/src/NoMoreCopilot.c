@@ -1,238 +1,163 @@
 ﻿#include "NoMoreCopilot.h"
 
-static __forceinline BOOLEAN IsWinKey(USHORT sc, USHORT fl)
-{
-  return IS_E0(fl) && (sc == SC_LWIN || sc == SC_RWIN);
-}
-static __forceinline BOOLEAN IsShiftKey(USHORT sc, USHORT fl)
-{
-  return !IS_E0(fl) && (sc == SC_LSHIFT || sc == SC_RSHIFT);
-}
-static __forceinline BOOLEAN IsF23(USHORT sc, USHORT fl)
-{
-  return sc == SC_F23 && ((!!IS_E0(fl)) == (!!F23_HAS_E0));
-}
+typedef VOID(*PFN_CLASS_SERVICE)(_In_ PDEVICE_OBJECT DeviceObject, _In_ PKEYBOARD_INPUT_DATA InputDataStart, _In_ PKEYBOARD_INPUT_DATA InputDataEnd, _Out_ PULONG InputDataConsumed);
 
-VOID SendKeys(PFILTER_CONTEXT ctx, PKEYBOARD_INPUT_DATA keys, ULONG count)
+#ifndef RTL_NUMBER_OF
+#define RTL_NUMBER_OF(A) (sizeof(A)/sizeof((A)[0]))
+#endif
+
+#define CHORD_WINDOW_100MS   (1000000ULL) // 100 ms in KeQueryInterruptTime units
+
+static __forceinline BOOLEAN IsLWin(USHORT sc, USHORT fl) { return HAS_E0(fl) && sc == SC_LWIN; }
+static __forceinline BOOLEAN IsLShift(USHORT sc, USHORT fl) { return !HAS_E0(fl) && sc == SC_LSHIFT; }
+static __forceinline BOOLEAN IsF23(USHORT sc, USHORT fl) { return sc == SC_F23 && (HAS_E0(fl) == (!!F23_HAS_E0)); }
+
+static __forceinline VOID EmitKey(_Out_ PKEYBOARD_INPUT_DATA out, USHORT unit, USHORT sc, BOOLEAN e0, BOOLEAN make)
 {
-  if (!ctx || !ctx->UpperConnectData.ClassService)
+  RtlZeroMemory(out, sizeof(*out));
+  out->UnitId = unit;
+  out->MakeCode = sc;
+  out->Flags = (e0 ? KEY_E0 : 0) | (make ? 0 : KEY_BREAK);
+}
+static __forceinline VOID EmitLWin(PKEYBOARD_INPUT_DATA o, USHORT u, BOOLEAN m) { EmitKey(o, u, SC_LWIN, TRUE, m); }
+static __forceinline VOID EmitLShift(PKEYBOARD_INPUT_DATA o, USHORT u, BOOLEAN m) { EmitKey(o, u, SC_LSHIFT, FALSE, m); }
+static __forceinline VOID EmitRCtrl(PKEYBOARD_INPUT_DATA o, USHORT u, BOOLEAN m) { EmitKey(o, u, SC_RCTRL, TRUE, m); }
+
+static __forceinline VOID SendKeys(_In_ PFILTER_CONTEXT ctx, _In_reads_(n) PKEYBOARD_INPUT_DATA keys, _In_ ULONG n)
+{
+  if (!ctx || !ctx->upperConnectData.ClassService || n == 0) 
     return;
   ULONG consumed = 0;
-  PFN_CLASS_SERVICE fn = (PFN_CLASS_SERVICE)(ULONG_PTR)ctx->UpperConnectData.ClassService;
-  fn(ctx->UpperConnectData.ClassDeviceObject, keys, keys + count, &consumed);
+  ((PFN_CLASS_SERVICE)(ULONG_PTR)ctx->upperConnectData.ClassService)(ctx->upperConnectData.ClassDeviceObject, keys, keys + n, &consumed);
 }
 
-static __forceinline VOID EmitKey(PKEYBOARD_INPUT_DATA outBuf, PULONG pCount, USHORT unit, USHORT sc, BOOLEAN e0, BOOLEAN make)
+typedef enum { ST_IDLE = 0, ST_EXPECT_SHIFT, ST_EXPECT_F23, ST_CHORD } STAGE;
+
+typedef struct _CHORD_STATE
 {
-  KEYBOARD_INPUT_DATA k; RtlZeroMemory(&k, sizeof(k));
-  k.UnitId = unit;
-  k.MakeCode = sc;
-  k.Flags = (e0 ? KEY_E0 : 0) | (make ? 0 : KEY_BREAK);
-  outBuf[(*pCount)++] = k;
-}
+  STAGE   stage;
+  USHORT  unit;
 
-static __forceinline VOID EmitRCtrl(PKEYBOARD_INPUT_DATA outBuf, PULONG pCount, USHORT unit, BOOLEAN make)
+  BOOLEAN swallowNextLWinUp;
+  BOOLEAN swallowNextLShiftUp;
+
+  ULONGLONG tWinDown;
+  ULONGLONG tShiftDown;
+} CHORD_STATE;
+
+static CHORD_STATE g = { 0 };
+
+static __forceinline VOID ResetState(VOID)
 {
-  EmitKey(outBuf, pCount, unit, SC_RCTRL, TRUE, make);
+  g.stage = ST_IDLE;
+  g.unit = 0;
+  g.swallowNextLWinUp = g.swallowNextLShiftUp = FALSE;
+  g.tWinDown = g.tShiftDown = 0;
 }
 
-static BOOLEAN g_UserShiftDown = FALSE;
-
-static __forceinline VOID TrackWhenForwarded(const KEYBOARD_INPUT_DATA* ev)
-{
-  if (IsShiftKey(ev->MakeCode, ev->Flags))
-    g_UserShiftDown = !IS_BREAK(ev->Flags);
-}
-
-static __forceinline VOID TrackWhenSynthesized(USHORT sc, BOOLEAN make)
-{
-  if (sc == SC_LSHIFT || sc == SC_RSHIFT)
-    g_UserShiftDown = make;
-}
-
-VOID KbFilter_ServiceCallback(PDEVICE_OBJECT DevObj, PKEYBOARD_INPUT_DATA inStart, PKEYBOARD_INPUT_DATA inEnd, PULONG inConsumed)
+VOID KbFilter_ServiceCallback(_In_ PDEVICE_OBJECT DevObj, _In_ PKEYBOARD_INPUT_DATA inStart, _In_ PKEYBOARD_INPUT_DATA inEnd, _Out_ PULONG inConsumed)
 {
   UNREFERENCED_PARAMETER(DevObj);
-  PFILTER_CONTEXT ctx = gCtx;
+  PFILTER_CONTEXT ctx = filterContext;
 
   KEYBOARD_INPUT_DATA inBuf[128];
   ULONG inCnt = (ULONG)(inEnd - inStart);
-  if (inCnt > RTL_NUMBER_OF(inBuf))
+  if (inCnt > RTL_NUMBER_OF(inBuf)) 
     inCnt = RTL_NUMBER_OF(inBuf);
-  for (ULONG i = 0; i < inCnt; ++i)
+  for (ULONG i = 0; i < inCnt; ++i) 
     inBuf[i] = inStart[i];
 
-  KEYBOARD_INPUT_DATA outBuf[128];
+  KEYBOARD_INPUT_DATA outBuf[256];
   ULONG outCount = 0;
 
-  static BOOLEAN Armed = FALSE;
-  static USHORT  ArmedUnit = 0;
-  static BOOLEAN SnapshotUserShift = FALSE;
-  static BOOLEAN SawChordShiftAfterArm = FALSE;
-
-  BOOLEAN HasF23Make = FALSE;
-  for (ULONG i = 0; i < inCnt; ++i)
-  {
-    if (IsF23(inBuf[i].MakeCode, inBuf[i].Flags) && !IS_BREAK(inBuf[i].Flags))
-    {
-      HasF23Make = TRUE;
-      break;
-    }
-  }
-
   KIRQL irql;
-  KeAcquireSpinLock(&ctx->SpinLock, &irql);
-
-  if (ctx->InReleasePhase)
-  {
-    for (ULONG i = 0; i < inCnt; ++i)
-    {
-      const KEYBOARD_INPUT_DATA* ev = &inBuf[i];
-      const USHORT sc = ev->MakeCode;
-      const USHORT fl = ev->Flags;
-      const BOOLEAN make = !IS_BREAK(fl);
-
-      if (!make)
-      {
-        if (IsShiftKey(sc, fl))
-        {
-          if (sc == SC_LSHIFT && ctx->PendingLShiftBreaks)
-          {
-            ctx->PendingLShiftBreaks--;
-            continue;
-          }
-          if (sc == SC_RSHIFT && ctx->PendingRShiftBreaks)
-          {
-            ctx->PendingRShiftBreaks--;
-            continue;
-          }
-        }
-        else if (IsWinKey(sc, fl))
-        {
-          if (sc == SC_LWIN && ctx->PendingLWinBreaks)
-          {
-            ctx->PendingLWinBreaks--;
-            continue;
-          }
-          if (sc == SC_RWIN && ctx->PendingRWinBreaks)
-          {
-            ctx->PendingRWinBreaks--;
-            continue;
-          }
-        }
-      }
-
-      outBuf[outCount++] = *ev;
-      TrackWhenForwarded(ev);
-    }
-
-    if (ctx->PendingLShiftBreaks == 0 && ctx->PendingRShiftBreaks == 0 && ctx->PendingLWinBreaks == 0 && ctx->PendingRWinBreaks == 0)
-      ctx->InReleasePhase = FALSE;
-
-    if (outCount) SendKeys(ctx, outBuf, outCount);
-    *inConsumed += inCnt;
-    KeReleaseSpinLock(&ctx->SpinLock, irql);
-    return;
-  }
+  KeAcquireSpinLock(&ctx->spinLock, &irql);
 
   for (ULONG i = 0; i < inCnt; ++i)
   {
-    KEYBOARD_INPUT_DATA* ev = &inBuf[i];
+    const KEYBOARD_INPUT_DATA* ev = &inBuf[i];
     const USHORT sc = ev->MakeCode;
     const USHORT fl = ev->Flags;
     const BOOLEAN make = !IS_BREAK(fl);
     const USHORT unit = ev->UnitId;
-    ctx->LastUnitId = unit;
+    const ULONGLONG now = KeQueryInterruptTime();
 
-    if (ctx->CopilotActive)
+    switch (g.stage)
     {
-      if (IsWinKey(sc, fl))
-        continue;
-
-      if (IsF23(sc, fl) && !make)
+    case ST_IDLE:
+      if (make && IsLWin(sc, fl))
       {
-        EmitRCtrl(outBuf, &outCount, unit, FALSE);
-        ctx->CopilotActive = FALSE;
-        ctx->InReleasePhase = TRUE;
+        g.stage = ST_EXPECT_SHIFT;
+        g.unit = unit;
+        g.tWinDown = now;
+        g.tShiftDown = 0;
+        continue;
+      }
+      break;
+
+    case ST_EXPECT_SHIFT:
+      if (make && unit == g.unit && IsLShift(sc, fl) && (now - g.tWinDown) <= CHORD_WINDOW_100MS)
+      {
+        g.tShiftDown = now;
+        g.stage = ST_EXPECT_F23;
+        continue;
+      }
+      
+      EmitLWin(&outBuf[outCount++], g.unit, TRUE);
+      ResetState();
+      break;
+
+    case ST_EXPECT_F23:
+      if (make && unit == g.unit && IsF23(sc, fl) && (now - g.tWinDown) <= CHORD_WINDOW_100MS && (now - g.tShiftDown) <= CHORD_WINDOW_100MS)
+      {
+        EmitRCtrl(&outBuf[outCount++], g.unit, TRUE);
+        g.stage = ST_CHORD;
         continue;
       }
 
-      outBuf[outCount++] = *ev;
-      TrackWhenForwarded(ev);
-      continue;
-    }
+      EmitLWin(&outBuf[outCount++], g.unit, TRUE);
+      EmitLShift(&outBuf[outCount++], g.unit, TRUE);
+      ResetState();
+      break;
 
-    if (!Armed)
-    {
-      if (make && IsWinKey(sc, fl) && sc == SC_LWIN)
+    case ST_CHORD:
+      if (unit == g.unit && IsF23(sc, fl))
       {
-        Armed = TRUE;
-        ArmedUnit = unit;
-        SnapshotUserShift = g_UserShiftDown;
-        SawChordShiftAfterArm = FALSE;
-        continue;
-      }
-
-      if (make && IsF23(sc, fl))
-      {
-        EmitKey(outBuf, &outCount, unit, SC_LWIN, TRUE, FALSE);
-        ctx->PendingLWinBreaks++;
-        EmitKey(outBuf, &outCount, unit, SC_LSHIFT, FALSE, FALSE);
-        TrackWhenSynthesized(SC_LSHIFT, FALSE);
-        ctx->PendingLShiftBreaks++;
-        EmitRCtrl(outBuf, &outCount, unit, TRUE);
-        ctx->CopilotActive = TRUE;
-        ctx->InReleasePhase = FALSE;
-        continue;
-      }
-
-      outBuf[outCount++] = *ev;
-      TrackWhenForwarded(ev);
-      continue;
-    }
-    else
-    {
-      if (make && IsShiftKey(sc, fl) && sc == SC_LSHIFT)
-      {
-        SawChordShiftAfterArm = TRUE;
-        continue;
-      }
-
-      if (make && IsF23(sc, fl))
-      {
-        EmitKey(outBuf, &outCount, ArmedUnit, SC_LWIN, TRUE, FALSE);
-        ctx->PendingLWinBreaks++;
-
-        if (!SnapshotUserShift)
+        if (!make)
         {
-          EmitKey(outBuf, &outCount, ArmedUnit, SC_LSHIFT, FALSE, FALSE);
-          TrackWhenSynthesized(SC_LSHIFT, FALSE);
+          EmitRCtrl(&outBuf[outCount++], g.unit, FALSE);
+          g.swallowNextLShiftUp = TRUE;
+          g.swallowNextLWinUp = TRUE;
         }
-        ctx->PendingLShiftBreaks++;
-
-        EmitRCtrl(outBuf, &outCount, ArmedUnit, TRUE);
-        ctx->CopilotActive = TRUE;
-        ctx->InReleasePhase = FALSE;
-
-        Armed = FALSE;
         continue;
       }
 
-      if (!make && IsWinKey(sc, fl) && sc == SC_LWIN)
+      if (!make && unit == g.unit)
       {
-        EmitKey(outBuf, &outCount, ArmedUnit, SC_LWIN, TRUE, TRUE);
-        outBuf[outCount++] = *ev;
-        Armed = FALSE;
-        continue;
+        if (IsLShift(sc, fl) && g.swallowNextLShiftUp)
+        {
+          g.swallowNextLShiftUp = FALSE;
+          if (!g.swallowNextLWinUp) 
+            ResetState();
+          continue;
+        }
+        if (IsLWin(sc, fl) && g.swallowNextLWinUp)
+        {
+          g.swallowNextLWinUp = FALSE;
+          if (!g.swallowNextLShiftUp) 
+            ResetState();
+          continue;
+        }
       }
 
-      outBuf[outCount++] = *ev;
-      TrackWhenForwarded(ev);
-      continue;
+      break;
     }
+
+    outBuf[outCount++] = *ev;
   }
 
-  if (outCount) SendKeys(ctx, outBuf, outCount);
+  if (outCount) 
+    SendKeys(ctx, outBuf, outCount);
   *inConsumed += inCnt;
-  KeReleaseSpinLock(&ctx->SpinLock, irql);
+  KeReleaseSpinLock(&ctx->spinLock, irql);
 }
